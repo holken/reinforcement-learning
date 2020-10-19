@@ -105,7 +105,7 @@ def train(policy_lr=1e-3,
             return rew + discount * (1 - done) * target_q
 
     def get_q_loss(obs, act, targets):
-        q_val = q_net(torch.cat([obs, act], dim=-1))
+        q_val = target_q_net(torch.cat([obs, act], dim=-1))
         return ((q_val - targets) ** 2).mean()
 
     def get_policy_loss(obs):
@@ -168,12 +168,10 @@ def train(policy_lr=1e-3,
         new_obs, reward, done, _ = env.step(act)
         done = 1 if done else 0
 
-        acc_rew += reward
-
         replay_buffer.store(obs, act, reward, new_obs, done)
 
         obs = new_obs
-
+        acc_rew += reward
 
         if done:
             obs = env.reset()
@@ -195,4 +193,4 @@ def train(policy_lr=1e-3,
 if __name__ == '__main__':
     # Possible env 'MountainCarContinuous-v0'
     # Possible env 'Pendulum-v0'
-    train(epochs=50, env_type='MountainCarContinuous-v0', act_noise=0.1)
+    train(epochs=50, env_type='Pendulum-v0', act_noise=0.1)
