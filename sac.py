@@ -3,9 +3,9 @@ import torch.nn as nn
 import gym
 import numpy as np
 from copy import deepcopy
-import matplotlib.pyplot as plt
+import itertools
 
-def mlp(sizes, activation=nn.ReLU, output_activation=nn.Identity):
+def mlp(sizes, activation=nn.Tanh, output_activation=nn.Identity):
     # Build a feedforward neural network.
     layers = []
     for j in range(len(sizes)-1):
@@ -16,11 +16,10 @@ def mlp(sizes, activation=nn.ReLU, output_activation=nn.Identity):
 def simple_deterministc_nn(obs_dim, act_dim):
     return nn.Sequential(
         nn.Linear(obs_dim, 64),
-        nn.ReLU(),
+        nn.Tanh(),
         nn.Linear(64, 64),
-        nn.ReLU(),
-        nn.Linear(64, act_dim),
-        nn.Tanh()
+        nn.Tanh(),
+        nn.Linear(64, act_dim)
     )
 
 
@@ -56,25 +55,27 @@ class ReplayBuffer():
 class CustomCritic(nn.Module):
     def __init__(self, sizes):
         super().__init__()
-        self.v_net = mlp(sizes=sizes)
+        self.v_net = mlp(sizes=sizes, activation=nn.Softmax)
 
     def forward(self, obs):
         return torch.squeeze(self.v_net(obs), -1)  # Critical to ensure v has right shape.
 
+
 def train(policy_lr=1e-3,
           q_lr=1e-3,
           hidden_sizes=[32],
-          epochs=50,
+          epochs=100,
           replay_buff_size=1000000,
           batch_sample_size=100,
           discount=0.99,
           epoch_size=4000,
-          trail_interval=10,
           update_after=1000,
           update_every=50,
           polyak=0.995,
           act_noise=0.1,
           start_steps=10000,
+          policy_delay=2,
+          noise_clip=0.5,
           env_type='CartPole-v1'):
 
     env = gym.make(env_type)
@@ -83,58 +84,55 @@ def train(policy_lr=1e-3,
     act_limit = env.action_space.high[0]
 
 
-    q_net = CustomCritic(sizes=[obs_dim + acts_n] + hidden_sizes + [1])
+    q_net_1 = CustomCritic(sizes=[obs_dim + acts_n] + hidden_sizes + [1])
+    q_net_2 = CustomCritic(sizes=[obs_dim + acts_n] + hidden_sizes + [1])
+
+    q_params = itertools.chain(q_net_1.parameters(), q_net_2.parameters())
+
+    # Real policies
     policy = simple_deterministc_nn(obs_dim, acts_n)
 
-    target_q_net = deepcopy(q_net)
+    # Target policies
+    target_q_net_1 = deepcopy(q_net_1)
+    target_q_net_2 = deepcopy(q_net_2)
+
     target_policy = deepcopy(policy)
 
-    q_opt = torch.optim.Adam(params=q_net.parameters(), lr=q_lr)
+    q_opt = torch.optim.Adam(params=q_params, lr=q_lr)
     policy_opt = torch.optim.Adam(params=policy.parameters(), lr=policy_lr)
 
-    def get_action(policy, obs, deterministic=False):
+    def get_action(policy, obs):
         with torch.no_grad():
-            act_no_noise = (policy(obs) * act_limit).numpy()
-        act = act_no_noise + ((act_noise * np.random.randn(acts_n)) if not deterministic else 0)
+            act_no_noise = policy(obs).numpy()
+        act = act_no_noise + (act_noise * np.random.randn(acts_n))
         return np.clip(act, -act_limit, act_limit)
-
-    def get_q_value(q_fn, obs, act):
-        return torch.squeeze(q_fn(torch.cat([obs, act], dim=-1)), -1)
 
     def compute_targets(next_obs, rew, done):
         with torch.no_grad():
-            target_a = target_policy(next_obs)
-            target_q = get_q_value(target_q_net, next_obs, target_a)
-            return rew + discount * (1 - done) * target_q
+            target_a = get_target_actions(next_obs)
+            target_q_1 = target_q_net_1(torch.cat([next_obs, target_a], dim=-1))
+            target_q_2 = target_q_net_2(torch.cat([next_obs, target_a], dim=-1))
+            q_target = torch.min(target_q_1, target_q_2)
+            return rew + discount * (1 - done) * q_target
 
     def get_q_loss(obs, act, targets):
-        q_val = get_q_value(q_net, obs, act)
-        return ((q_val - targets) ** 2).mean()
+        q_val_1 = q_net_1(torch.cat([obs, act], dim=-1))
+        q_val_2 = q_net_2(torch.cat([obs, act], dim=-1))
+        loss_q1 = ((q_val_1 - targets) ** 2).mean()
+        loss_q2 = ((q_val_2 - targets) ** 2).mean()
+        return loss_q1 + loss_q2
 
     def get_policy_loss(obs):
         act = policy(obs)
-        q_val = get_q_value(q_net, obs, act)
-        return -(q_val.mean())
+        q_val = q_net_1(torch.cat([obs, act], dim=-1))
+        return -q_val.mean()
 
+    def get_target_actions(new_obs):
+        target_a = target_policy(new_obs).numpy()
+        target_a += np.clip(np.random.randn(acts_n), -noise_clip, noise_clip)  # TODO, check if the noise is correct
+        return torch.as_tensor(np.clip(target_a, -act_limit, act_limit), dtype=torch.float32)
 
-    def run_trial():
-        render_attempt = True
-        for j in range(5):
-            obs = env.reset()
-            ep_ret = 0
-            ep_len = 0
-            done = False
-            while not(done or ep_len == epoch_size):
-                if j == 0:
-                    env.render()
-                act = get_action(policy, torch.as_tensor(obs, dtype=torch.float32), deterministic=True)
-                obs, reward, done, _ = env.step(act)
-                ep_ret += reward
-                ep_len += 1
-
-            print(f"Reward trial {j}: {ep_ret / ep_len}")
-
-    def update():
+    def update(j):
         transitions = replay_buffer.sample_batch(batch_sample_size)
         obs = transitions['obs']
         act = transitions['act']
@@ -149,26 +147,31 @@ def train(policy_lr=1e-3,
         q_loss.backward()
         q_opt.step()
 
-        for q in q_net.parameters():
-            q.requires_grad = False
+        if j % policy_delay == 0:
+            for p in q_params:
+                p.requires_grad = False
 
-        policy_opt.zero_grad()
-        policy_loss = get_policy_loss(obs)
-        policy_loss.backward()
-        policy_opt.step()
+            policy_opt.zero_grad()
+            policy_loss = get_policy_loss(obs)
+            policy_loss.backward()
+            policy_opt.step()
 
-        for q in q_net.parameters():
-            q.requires_grad = True
+            for p in q_params:
+                p.requires_grad = True
 
-        with torch.no_grad():
-            for q, q_targ in zip(q_net.parameters(), target_q_net.parameters()):
-                q_targ.data.mul_(polyak)
-                q_targ.data.add_((1 - polyak) * q.data)
+            with torch.no_grad():
+                for q, q_targ in zip(q_net_1.parameters(), target_q_net_1.parameters()):
+                    q_targ.data.mul_(polyak)
+                    q_targ.data.add_((1 - polyak) * q.data)
 
-        with torch.no_grad():
-            for p, p_targ in zip(policy.parameters(), target_policy.parameters()):
-                p_targ.data.mul_(polyak)
-                p_targ.data.add_((1 - polyak) * p.data)
+                for q, q_targ in zip(q_net_2.parameters(), target_q_net_2.parameters()):
+                    q_targ.data.mul_(polyak)
+                    q_targ.data.add_((1 - polyak) * q.data)
+
+            with torch.no_grad():
+                for p, p_targ in zip(policy.parameters(), target_policy.parameters()):
+                    p_targ.data.mul_(polyak)
+                    p_targ.data.add_((1 - polyak) * p.data)
 
 
     # Keeps s, a, r, s', d
@@ -176,9 +179,7 @@ def train(policy_lr=1e-3,
     obs = env.reset()
     render_attempt = True
     acc_rew = 0
-    rewards = []
-    print(trail_interval * epoch_size)
-    for t in range(1, epochs * epoch_size + 1):
+    for t in range(epochs * epoch_size):
 
         if render_attempt:
             env.render()
@@ -189,33 +190,28 @@ def train(policy_lr=1e-3,
             act = env.action_space.sample()
 
         new_obs, reward, done, _ = env.step(act)
-        done = False if t % epoch_size == 0 else done
-
-        acc_rew += reward
+        done = 1 if done else 0
 
         replay_buffer.store(obs, act, reward, new_obs, done)
 
         obs = new_obs
+        acc_rew += reward
 
-        if done or t % epoch_size == 0:
+        if done:
             obs = env.reset()
             render_attempt = False
 
         if t >= update_after and t % update_every == 0:
-            for _ in range(update_every):
-                update()
+            for j in range(update_every):
+                update(j)
         if t % epoch_size == 0:
-            rewards.append(acc_rew)
+            print(f"step: {t}")
+            print(f"acc reward: {acc_rew}")
             acc_rew = 0
             render_attempt = True
 
-        if (epoch_size*10) > t > (epoch_size*10 - 1000):
-            print(t)
-        if t % (trail_interval * epoch_size) == 0:
-            run_trial()
 
-    plt.plot(range(len(rewards)), rewards)
-    plt.show()
+
 
 
 if __name__ == '__main__':
